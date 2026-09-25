@@ -1195,3 +1195,242 @@ def test_portion_diagnosis_unknown_target_returns_404(client):
     s1 = make_sample(client, "S1")
     assert diagnose(client, 4242, measured((s1, 1, 1)), 10).status_code == 404
 
+
+
+# --------------------------------------------------------------------------- #
+# POST/GET /batches/{id}/stock + POST /batches/{id}/preparations
+# --------------------------------------------------------------------------- #
+
+
+def add_stock(client, batch_id, portions):
+    return client.post(f"/batches/{batch_id}/stock", json={"portions": portions})
+
+
+def stock_of(client, batch_id):
+    return client.get(f"/batches/{batch_id}/stock")
+
+
+def prepare(client, batch_id, count):
+    return client.post(f"/batches/{batch_id}/preparations", json={"count": count})
+
+
+def test_stock_default_balance_is_zero(client):
+    s1 = make_sample(client, "S1")
+    r = stock_of(client, s1)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"sample_id": s1, "sample_name": "S1", "portions": 0}
+
+
+def test_stock_add_positive_portions_accumulates(client):
+    s1 = make_sample(client, "S1")
+    r = add_stock(client, s1, 3)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"sample_id": s1, "sample_name": "S1", "portions": 3}
+    assert add_stock(client, s1, 5).json()["portions"] == 8
+    # GET 返回当前余额
+    assert stock_of(client, s1).json()["portions"] == 8
+
+
+@pytest.mark.parametrize("portions", [0, -3, 1.5, 2.0, "2", True, None])
+def test_stock_add_rejects_non_positive_integer(client, portions):
+    s1 = make_sample(client, "S1")
+    assert add_stock(client, s1, portions).status_code == 422
+
+
+def test_stock_unknown_batch_returns_400(client):
+    r = add_stock(client, 999, 1)
+    assert r.status_code == 400
+    assert "999" in r.json()["detail"]
+    r = stock_of(client, 999)
+    assert r.status_code == 400
+    assert "999" in r.json()["detail"]
+
+
+def test_stock_pool_batch_rejected(client):
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+    assert add_stock(client, p1, 1).status_code == 400
+    assert stock_of(client, p1).status_code == 400
+
+
+def test_preparation_sample_target_consumes_itself(client):
+    s1 = make_sample(client, "S1")
+    assert add_stock(client, s1, 10).status_code == 200
+    r = prepare(client, s1, 3)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["batch_id"] == s1
+    assert body["batch_name"] == "S1"
+    assert body["count"] == 3
+    assert body["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 3}]
+    assert body["remaining_stock"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 7}]
+    assert "id" in body and "created_at" in body
+    assert stock_of(client, s1).json()["portions"] == 7
+
+
+def test_preparation_multilevel_integer_demand_with_merged_paths(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    # P2 = 1×P1 + 1×S1：S1 经两条路径合并
+    p2 = make_pool(client, "P2", [
+        {"batch_id": p1, "portions": 1}, {"batch_id": s1, "portions": 1}])
+    # P3 = 3×P2 + 1×S2 → 一次制备消耗 S1=6、S2=4
+    p3 = make_pool(client, "P3", [
+        {"batch_id": p2, "portions": 3}, {"batch_id": s2, "portions": 1}])
+    add_stock(client, s1, 12)
+    add_stock(client, s2, 8)
+
+    r = prepare(client, p3, 1)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["consumptions"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 6},
+        {"sample_id": s2, "sample_name": "S2", "portions": 4},
+    ]
+    assert body["remaining_stock"] == [
+        {"sample_id": s1, "sample_name": "S1", "portions": 6},
+        {"sample_id": s2, "sample_name": "S2", "portions": 4},
+    ]
+
+    # 再制备一次（扣 6/4），余额归零
+    r2 = prepare(client, p3, 1)
+    assert r2.status_code == 201, r2.text
+    assert [c["portions"] for c in r2.json()["consumptions"]] == [6, 4]
+    assert [s["portions"] for s in r2.json()["remaining_stock"]] == [0, 0]
+
+
+def test_preparation_count_is_multiplied_through_graph(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_stock(client, s1, 100)
+    add_stock(client, s2, 100)
+    r = prepare(client, p1, 5)
+    assert r.status_code == 201, r.text
+    assert [c["portions"] for c in r.json()["consumptions"]] == [5, 5]
+    assert [s["portions"] for s in r.json()["remaining_stock"]] == [95, 95]
+
+
+def test_preparation_insufficient_stock_returns_409_with_shortfalls(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_stock(client, s1, 3)   # 需要 5
+    add_stock(client, s2, 5)   # 恰好够
+
+    r = prepare(client, p1, 5)
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["message"] == "原始样本库存不足"
+    assert detail["shortfalls"] == [
+        {"sample_id": s1, "sample_name": "S1",
+         "required": 5, "available": 3, "shortage": 2},
+    ]
+
+
+def test_preparation_insufficient_lists_every_short_sample_sorted(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 2}, {"batch_id": s2, "portions": 3}])
+    # 两个样本都从未补入：缺口 = 需求（S1=2、S2=3），按 id 升序全部列出
+    r = prepare(client, p1, 1)
+    assert r.status_code == 409, r.text
+    assert [(s["sample_id"], s["shortage"], s["available"])
+            for s in r.json()["detail"]["shortfalls"]] == [(s1, 2, 0), (s2, 3, 0)]
+
+
+def test_preparation_conflict_changes_nothing_then_succeeds_after_restock(client):
+    s1 = make_sample(client, "S1")
+    p1 = make_pool(client, "P1", [{"batch_id": s1, "portions": 1}])
+
+    r = prepare(client, p1, 2)
+    assert r.status_code == 409
+    # 库存与制备记录均不变化
+    assert stock_of(client, s1).json()["portions"] == 0
+    assert client.get("/batches").status_code == 200
+
+    add_stock(client, s1, 1)
+    assert prepare(client, p1, 2).status_code == 409  # 仍缺 1 份，余额不变
+    assert stock_of(client, s1).json()["portions"] == 1
+    add_stock(client, s1, 1)
+    r = prepare(client, p1, 2)
+    assert r.status_code == 201, r.text
+    assert stock_of(client, s1).json()["portions"] == 0
+
+
+def test_preparation_get_by_id_returns_record_and_current_remaining(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_stock(client, s1, 10)
+    add_stock(client, s2, 10)
+    created = prepare(client, p1, 2).json()
+
+    r = client.get(f"/preparations/{created['id']}")
+    assert r.status_code == 200, r.text
+    assert r.json() == created
+    # 后续再消耗后，旧记录的剩余库存反映查询时的当前余额
+    add_stock(client, s1, 5)
+    prepare(client, p1, 3)  # 再扣 3/3
+    r = client.get(f"/preparations/{created['id']}")
+    assert r.status_code == 200
+    assert [s["portions"] for s in r.json()["remaining_stock"]] == [
+        10 - 2 + 5 - 3, 10 - 2 - 3]
+    # 消耗明细保持历史值不变
+    assert [c["portions"] for c in r.json()["consumptions"]] == [2, 2]
+
+
+def test_preparation_get_unknown_id_returns_404(client):
+    r = client.get("/preparations/4242")
+    assert r.status_code == 404
+    assert "4242" in r.json()["detail"]
+
+
+def test_preparation_unknown_batch_returns_400(client):
+    r = prepare(client, 999, 1)
+    assert r.status_code == 400
+    assert "999" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("count", [0, -3, 1.5, 2.0, "2", True, None])
+def test_preparation_rejects_non_positive_integer_count(client, count):
+    s1 = make_sample(client, "S1")
+    assert prepare(client, s1, count).status_code == 422
+
+
+def test_preparation_concurrent_requests_never_oversell(client):
+    # 库存只够恰好一次制备：并发若干次，只允许一次成功，其余 409，余额绝不被扣成负数
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    add_stock(client, s1, 1)
+    add_stock(client, s2, 1)
+    barrier = threading.Barrier(4)
+    lock = threading.Lock()
+    codes: list[int] = []
+
+    def run():
+        barrier.wait()
+        r = prepare(client, p1, 1)
+        with lock:
+            codes.append(r.status_code)
+
+    threads = [threading.Thread(target=run) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(codes).count(201) == 1
+    assert sorted(codes).count(409) == 3
+    assert stock_of(client, s1).json()["portions"] == 0
+    assert stock_of(client, s2).json()["portions"] == 0

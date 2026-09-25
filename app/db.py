@@ -30,6 +30,28 @@ CREATE TABLE IF NOT EXISTS exclusion_rules (
     PRIMARY KEY (low_sample_id, high_sample_id),
     CHECK (low_sample_id < high_sample_id)
 );
+
+CREATE TABLE IF NOT EXISTS sample_stocks (
+    -- 原始样本库存（份）；从未补入的样本没有行，余额视为 0
+    sample_id INTEGER PRIMARY KEY REFERENCES batches (id),
+    portions  INTEGER NOT NULL CHECK (portions >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS preparations (
+    -- 一次制备记录：对目标批次制备 count 次
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id   INTEGER NOT NULL REFERENCES batches (id),
+    count      INTEGER NOT NULL CHECK (count > 0),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS preparation_consumptions (
+    -- 该次制备沿配方图逐层乘算并合并多路径后，对各原始样本的整数消耗明细
+    preparation_id INTEGER NOT NULL REFERENCES preparations (id) ON DELETE CASCADE,
+    sample_id      INTEGER NOT NULL REFERENCES batches (id),
+    portions       INTEGER NOT NULL CHECK (portions > 0),
+    PRIMARY KEY (preparation_id, sample_id)
+);
 """
 
 

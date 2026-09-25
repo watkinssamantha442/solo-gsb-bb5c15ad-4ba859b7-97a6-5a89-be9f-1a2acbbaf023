@@ -50,6 +50,35 @@ def _expand(
     return result
 
 
+def preparation_requirements(
+    conn: sqlite3.Connection, batch_id: int, count: int
+) -> dict[int, int]:
+    """制备 count 次批次 batch_id 需要消耗的各原始样本整数份数。
+
+    沿配方图逐层乘算：从目标批次的 count 份开始，混样每消耗自身 weight 份，
+    就向其直接原料各摊入 weight × 配方份数；同一原料经多条路径到达时需求相加
+    合并；最终落到原始样本上的权重（再乘制备次数）即为该样本的整数消耗。
+    与占比分摊不同，这里全程只做整数乘加（份数始终按“份”而非比例流动），
+    结果恒为整数。原始样本目标直接消耗自身。
+    注意多路径汇合的混样需按各路径权重分别展开（不像占比有按份归一的单份
+    缓存），需求在叶子样本上累加合并。配方图是有向无环图（新批次只能引用
+    更早创建的批次），递归必然终止。
+    """
+    kinds, recipes = _load_graph(conn)
+    demand: dict[int, int] = {}
+
+    def expand(node: int, weight: int) -> None:
+        if kinds[node] == "sample":
+            # 原始样本目标直接消耗自身
+            demand[node] = demand.get(node, 0) + weight
+            return
+        for ingredient_id, portions in recipes.get(node, []):
+            expand(ingredient_id, weight * portions)
+
+    expand(batch_id, count)
+    return demand
+
+
 def reachable_samples(conn: sqlite3.Connection, ingredient_ids: list[int]) -> set[int]:
     """沿配方图递归收集若干原料批次可达的全部原始样本 id。
 

@@ -19,6 +19,40 @@ class SampleCreate(BaseModel):
     name: BatchName
 
 
+class StockAddRequest(BaseModel):
+    """为已有原始样本补入正整数份库存。"""
+
+    portions: StrictPositiveInt
+
+
+class StockOut(BaseModel):
+    sample_id: int
+    sample_name: str
+    portions: int  # 当前库存份数（补入后/查询时）；从未补入的样本为 0
+
+
+class PreparationCreate(BaseModel):
+    """制备次数：严格正整数（拒绝 0、负数、小数与字符串）。"""
+
+    count: StrictPositiveInt
+
+
+class ConsumptionOut(BaseModel):
+    sample_id: int
+    sample_name: str
+    portions: int  # 该次制备对该原始样本的整数消耗，恒为正
+
+
+class PreparationOut(BaseModel):
+    id: int
+    batch_id: int
+    batch_name: str
+    count: int
+    created_at: str
+    consumptions: list[ConsumptionOut]    # 按样本 id 升序的整数消耗明细
+    remaining_stock: list[StockOut]       # 各消耗样本的剩余库存，按样本 id 升序
+
+
 class ExclusionRuleCreate(BaseModel):
     """登记一对不同的原始样本禁配对；顺序无关，服务端按 id 归一化。"""
 
