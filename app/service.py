@@ -11,6 +11,8 @@ from fractions import Fraction
 
 Composition = dict[int, Fraction]  # {原始样本 id: 占比}
 Recipes = dict[int, list[tuple[int, int]]]  # {混样批次 id: [(原料批次 id, 份数)]}
+# 制备单位整数消耗：{批次 id: {原始样本 id: 制备一次所需整数份数}}
+UnitNeeds = dict[int, dict[int, int]]
 
 
 class PoolPlanError(ValueError):
@@ -363,3 +365,42 @@ def portion_diagnosis(
         ):
             solutions.append((ingredient_id, original, corrected))
     return solutions, undetermined
+
+
+def _unit_needs(
+    kinds: dict[int, str],
+    recipes: Recipes,
+    batch_id: int,
+    memo: UnitNeeds,
+) -> dict[int, int]:
+    """计算制备一批次一次所需各原始样本的整数份数（单位消耗向量）。
+
+    - 原始样本制备一次直接消耗自身 1 份；
+    - 混样制备一次按配方消耗各直接原料“份数”次，各原料的单位消耗按份数
+      逐层相乘；同一原始样本经多条配方路径到达时需求相加合并；
+    - 配方份数与制备次数都是正整数，逐层乘算、合并的结果恒为整数，
+      无需分数运算；memo 让多路径汇合的批次只计算一次。
+    """
+    if batch_id in memo:
+        return memo[batch_id]
+    if kinds[batch_id] == "sample":
+        memo[batch_id] = {batch_id: 1}
+        return memo[batch_id]
+    needs: dict[int, int] = {}
+    for ingredient_id, portions in recipes.get(batch_id, []):
+        for sample_id, unit in _unit_needs(kinds, recipes, ingredient_id, memo).items():
+            needs[sample_id] = needs.get(sample_id, 0) + portions * unit
+    memo[batch_id] = needs
+    return needs
+
+
+def preparation_requirements(
+    conn: sqlite3.Connection, batch_id: int, times: int
+) -> dict[int, int]:
+    """制备 batch_id 共 times 次所需各原始样本的整数份数。
+
+    返回 {原始样本 id: 份数}，只含需求为正的样本，按 id 升序由调用方处理。
+    """
+    kinds, recipes = _load_graph(conn)
+    units = _unit_needs(kinds, recipes, batch_id, {})
+    return {sample_id: unit * times for sample_id, unit in units.items()}

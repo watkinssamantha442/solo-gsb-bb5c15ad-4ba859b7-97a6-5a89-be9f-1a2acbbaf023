@@ -211,3 +211,38 @@ class PortionDiagnosisOut(BaseModel):
     batch_name: BatchName
     solutions: list[PortionDiagnosisSolutionOut]         # 按原料 id 升序，无解为空列表
     undetermined: list[PortionDiagnosisUndeterminedOut]  # 按原料 id 升序
+
+
+class InventoryAddRequest(BaseModel):
+    """为已有原始样本补入库存（正整数份数，累加到当前余额）。"""
+
+    portions: StrictPositiveInt
+
+
+class InventoryOut(BaseModel):
+    sample_id: int
+    sample_name: str
+    balance: int     # 当前库存余额（份），未补入过的原始样本为 0
+    updated_at: str | None = None  # 最近一次补入时间；从未补入时为 null
+
+
+class PreparationCreateRequest(BaseModel):
+    """批次制备：正整数制备次数（每制备一次按配方消耗一批）。"""
+
+    times: StrictPositiveInt
+
+
+class PreparationConsumptionOut(BaseModel):
+    sample_id: int
+    sample_name: str
+    portions: int  # 本次制备沿配方图逐层乘算、多路径合并后消耗的整数份数
+
+
+class PreparationOut(BaseModel):
+    id: int
+    batch_id: int
+    batch_name: BatchName
+    times: int  # 制备次数（正整数）
+    created_at: str
+    consumptions: list[PreparationConsumptionOut]  # 各原始样本整数消耗，按样本 id 升序
+    remaining_inventory: list[InventoryOut]        # 扣减后的剩余库存，按样本 id 升序

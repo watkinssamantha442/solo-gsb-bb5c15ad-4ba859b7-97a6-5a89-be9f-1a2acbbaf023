@@ -13,6 +13,7 @@
 - **目标占比规划**：给定两个不同的已有批次、一个原始样本与目标占比，反算使新混样精确达标的**正整数投入份数**，只返回总份数最小的整数解（两原料占比都等于目标时取 1:1），配方可直接提交 `/pools`；**只规划、不创建批次**
 - **配方变更影响预演**：提交完整替代配方，在内存中演算目标批次及全部下游批次各原始样本的原占比、预演占比与有符号差值，**不修改数据库**
 - **份数诊断**：假设混样配方仅一项投入份数记错，按实测原始样本占比用有理数方程反推该项的正整数份数，并用全部样本占比复核；份数变化不改变组成且与实测吻合的项列为**无法判定**；**不修改数据库**
+- **原始样本库存与批次制备**：可为已有原始样本补入**正整数份**库存并查询余额；`POST /batches/{id}/preparations` 按**正整数次数**制备批次，每制备一次混样按其配方消耗相应份数的上游批次，沿配方图逐层乘算、多路径需求合并为各原始样本的**整数消耗**（原始样本目标直接消耗自身）；核算与扣减在**同一 SQLite 写事务**内完成，任一样本库存不足即返回 **409** 与各样缺口、库存与制备记录均不变化，足量时一次扣减并保存目标批次、次数与消耗明细，可按记录 id 查询
 - 依赖安装与数据库建表全部纳入启动流程，无需手工初始化
 
 ## 快速开始（Docker）
@@ -58,6 +59,10 @@ docker compose up --build
 | `GET` | `/batches/{id}/composition` | 递归追溯原始样本占比 |
 | `POST` | `/batches/{id}/recipe-preview` | 配方变更影响预演（不写库） |
 | `POST` | `/batches/{id}/portion-diagnosis` | 份数诊断：假设仅一项份数记错，反推正整数份数（不写库） |
+| `POST` | `/batches/{id}/inventory` | 为原始样本补入正整数份库存（累加） |
+| `GET` | `/batches/{id}/inventory` | 查询原始样本库存余额（未补入为 0） |
+| `POST` | `/batches/{id}/preparations` | 批次制备：按整数次数消耗原始样本库存（不足 409 且整体回滚） |
+| `GET` | `/preparations/{id}` | 按记录 id 查询制备记录（消耗明细 + 当前剩余库存） |
 
 ## 示例请求
 
@@ -342,6 +347,86 @@ curl -X POST http://localhost:8000/batches/4/portion-diagnosis \
 
 校验：`3×P1 + 1×S1` 中 S1 = 3/4×1/2 + 1/4×1 = 5/8，S2 = 3/4×1/2 = 3/8，与实测一致；把 S1 的份数改成任何值都无法得到该组成，故 P1 是唯一可疑项。
 
+### 10. 原始样本库存与批次制备
+
+**补入库存 / 查询余额**：原始样本以“份”为单位持有库存。`POST /batches/{id}/inventory` 为**已存在的原始样本**补入正整数份（`portions`，累加到当前余额），返回补入后的余额与更新时间；`GET /batches/{id}/inventory` 查询余额，**从未补入过的样本余额为 0**（`updated_at` 为 `null`）。未知批次返回 **400**；混样批次不能持有库存，返回 **400**；非正整数份数返回 **422**。
+
+```bash
+# S1=1、S2=2，补入 10 份 S1 与 5 份 S2
+curl -X POST http://localhost:8000/batches/1/inventory \
+  -H 'Content-Type: application/json' -d '{"portions": 10}'
+# {"sample_id":1,"sample_name":"S1","balance":10,"updated_at":"2026-09-25T10:00:00.000Z"}
+
+curl http://localhost:8000/batches/2/inventory
+# {"sample_id":2,"sample_name":"S2","balance":0,"updated_at":null}
+```
+
+**批次制备**：`POST /batches/{id}/preparations` 接收正整数**制备次数** `times`。每制备一次：
+
+- 目标是**原始样本**时直接消耗**自身 1 份**；
+- 目标是**混样**时按其配方消耗相应份数的上游批次，再沿配方图**逐层乘算**，同一原始样本经多条路径到达时需求**相加合并**，最终得到各原始样本的**整数消耗**（份数均为整数，全程不产生分数）。
+
+**核算与扣减在同一个 SQLite 写事务内完成**（`BEGIN IMMEDIATE` 立即取写锁）：
+
+- 任一样本**库存不足**：整体回滚返回 **409**，`detail.shortages` 按样本 id 升序列出每个缺口样本的需求份数、可用份数与缺口，**库存与制备记录均不变化**，可补足后原样重试；
+- **全部足量**：一次扣减各样本库存，写入制备记录（目标批次、次数）与消耗明细，返回 **201**：记录内容与扣减后的剩余库存。
+
+沿用前面的批次（P1=`1×S1+1×S2` id=3，P2=`1×P1+1×S1` id=4）。制备 P2 一次时，S1 经 P1（1 份）与直接投入（1 份）两条路径合并为 2 份、S2 为 1 份；制备 3 次即 `6×S1 + 3×S2`：
+
+```bash
+curl -X POST http://localhost:8000/batches/4/preparations \
+  -H 'Content-Type: application/json' -d '{"times": 3}'
+```
+
+```json
+{
+  "id": 1,
+  "batch_id": 4,
+  "batch_name": "P2",
+  "times": 3,
+  "created_at": "2026-09-25T10:05:00.000Z",
+  "consumptions": [
+    {"sample_id": 1, "sample_name": "S1", "portions": 6},
+    {"sample_id": 2, "sample_name": "S2", "portions": 3}
+  ],
+  "remaining_inventory": [
+    {"sample_id": 1, "sample_name": "S1", "balance": 4, "updated_at": "2026-09-25T10:00:00.000Z"},
+    {"sample_id": 2, "sample_name": "S2", "balance": 2, "updated_at": "2026-09-25T10:00:00.000Z"}
+  ]
+}
+```
+
+**按记录 id 查询**：`GET /preparations/{id}` 返回同结构的制备记录；`consumptions` 是该次制备的历史快照，`remaining_inventory` 为**查询时**的实时余额（后续补库/制备会反映其中）。记录不存在返回 **404**。
+
+```bash
+curl http://localhost:8000/preparations/1
+```
+
+库存不足的例子（S1 余 4 份，再制备 P2 三次需 6 份；S2 余 2 份，需 3 份）：
+
+```bash
+curl -X POST http://localhost:8000/batches/4/preparations \
+  -H 'Content-Type: application/json' -d '{"times": 3}'
+```
+
+```json
+{
+  "detail": {
+    "message": "原始样本库存不足",
+    "shortages": [
+      {"sample_id": 1, "sample_name": "S1", "required": 6, "available": 4, "shortage": 2},
+      {"sample_id": 2, "sample_name": "S2", "required": 3, "available": 2, "shortage": 1}
+    ]
+  }
+}
+```
+
+说明：
+
+- 恰好耗尽（需求 = 余额）视为足量，制备成功且对应余额变为 0；从未补入库存的样本可用份数为 0；
+- 制备次数必须为严格正整数（0、负数、小数、字符串、布尔均 **422**）；目标批次不存在返回 **400**；
+- 并发制备由同一写事务串行：不会出现库存超扣（余额恒非负），库存只够部分请求时其余请求得到 409 且不留任何记录。
+
 ### 错误示例
 
 ```bash
@@ -403,6 +488,35 @@ curl -X POST http://localhost:8000/batches/3/portion-diagnosis -H 'Content-Type:
 # 份数诊断：目标不是混样批次 → 400
 curl -X POST http://localhost:8000/batches/1/portion-diagnosis -H 'Content-Type: application/json' \
   -d '{"measurements": [{"sample_id": 1, "numerator": 1, "denominator": 1}], "max_portions": 10}'
+
+# 为不存在的批次补入/查询库存 → 400 {"detail":"未知批次 id: 999"}
+curl -X POST http://localhost:8000/batches/999/inventory -H 'Content-Type: application/json' \
+  -d '{"portions": 5}'
+curl http://localhost:8000/batches/999/inventory
+
+# 为混样批次补入库存 → 400（只有原始样本可持有库存）
+curl -X POST http://localhost:8000/batches/3/inventory -H 'Content-Type: application/json' \
+  -d '{"portions": 5}'
+
+# 补入非正整数份（0 / 负数 / 小数 / 字符串 / 布尔）→ 422
+curl -X POST http://localhost:8000/batches/1/inventory -H 'Content-Type: application/json' \
+  -d '{"portions": 0}'
+
+# 制备不存在的批次 → 400 {"detail":"未知批次 id: 999"}
+curl -X POST http://localhost:8000/batches/999/preparations -H 'Content-Type: application/json' \
+  -d '{"times": 1}'
+
+# 制备次数非正整数 → 422
+curl -X POST http://localhost:8000/batches/1/preparations -H 'Content-Type: application/json' \
+  -d '{"times": 0}'
+
+# 库存不足 → 409（缺口明细，库存与制备记录均不变化）
+curl -X POST http://localhost:8000/batches/4/preparations -H 'Content-Type: application/json' \
+  -d '{"times": 3}'
+# {"detail":{"message":"原始样本库存不足","shortages":[{"sample_id":1,...}]}}
+
+# 查询不存在的制备记录 → 404
+curl http://localhost:8000/preparations/999
 ```
 
 ## 占比计算说明
@@ -426,12 +540,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理（含禁配规则登记/查询与补录影响预演、目标占比规划、配方变更预演、份数诊断端点）
-  db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则表与写事务设置）
+  main.py       # FastAPI 路由与请求处理（禁配规则、目标占比规划、配方预演、份数诊断、库存补入与批次制备端点）
+  db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则、库存与制备记录表及写事务设置）
   schemas.py    # Pydantic 请求/响应模型（含严格正整数校验）
-  service.py    # 递归占比计算、配方图可达原始样本、禁配补录影响预演、目标占比反算、配方预演与份数诊断（Fraction 精确分数）
+  service.py    # 递归占比计算、配方图可达原始样本、禁配补录影响预演、目标占比反算、配方预演、份数诊断与制备整数消耗（Fraction 精确分数）
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、并发与各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则与补录影响预演、库存与制备扣减、并发与各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt

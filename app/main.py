@@ -11,6 +11,10 @@
 - GET  /batches/{batch_id}/composition 递归计算原始样本占比（约分后的分子/分母）
 - POST /batches/{batch_id}/recipe-preview 配方变更影响预演（内存计算，不写库）
 - POST /batches/{batch_id}/portion-diagnosis 份数诊断：假设仅一项份数记错，反推正整数份数（不写库）
+- POST /batches/{batch_id}/inventory   为原始样本补入正整数份库存（累加）
+- GET  /batches/{batch_id}/inventory   查询原始样本库存余额
+- POST /batches/{batch_id}/preparations 批次制备：正整数次数，沿配方图整数消耗原始样本库存（不足 409 且整体回滚）
+- GET  /preparations/{preparation_id}  按记录 id 查询制备记录（含消耗明细与当前剩余库存）
 """
 from __future__ import annotations
 
@@ -33,6 +37,8 @@ from .schemas import (
     ImpactPreviewBatchOut,
     ImpactPreviewOut,
     ImpactPreviewRequest,
+    InventoryAddRequest,
+    InventoryOut,
     PoolCreate,
     PoolPlanOut,
     PoolPlanRecipeItemOut,
@@ -41,6 +47,9 @@ from .schemas import (
     PortionDiagnosisRequest,
     PortionDiagnosisSolutionOut,
     PortionDiagnosisUndeterminedOut,
+    PreparationConsumptionOut,
+    PreparationCreateRequest,
+    PreparationOut,
     PreviewComponentOut,
     RecipeItemOut,
     RecipePreviewOut,
@@ -53,6 +62,7 @@ from .service import (
     exclusion_impact_preview,
     pool_plan,
     portion_diagnosis,
+    preparation_requirements,
     reachable_samples,
     recipe_preview,
 )
@@ -682,3 +692,250 @@ def diagnose_portions(
             for i, original in undetermined
         ],
     )
+
+
+def _inventory_out(conn: sqlite3.Connection, row: sqlite3.Row) -> InventoryOut:
+    """构造原始样本库存响应；row 须含 sample_id/balance/updated_at/sample_name。"""
+    return InventoryOut(
+        sample_id=row["sample_id"],
+        sample_name=row["sample_name"],
+        balance=row["balance"],
+        updated_at=row["updated_at"],
+    )
+
+
+@app.post(
+    "/batches/{batch_id}/inventory",
+    response_model=InventoryOut,
+    summary="为原始样本补入库存（正整数份数，累加到余额）",
+)
+def add_inventory(
+    batch_id: int,
+    payload: InventoryAddRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> InventoryOut:
+    # 与 /pools 一致：未知批次按业务输入错误返回 400
+    row = _fetch_batch(conn, batch_id)
+    if row is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {batch_id}")
+    if row["kind"] != "sample":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"只有原始样本可补入库存（kind='sample'）: {batch_id}",
+        )
+
+    conn.execute("BEGIN IMMEDIATE")
+    # 同一写事务内累加余额并刷新更新时间：UPSERT 幂等兼容“首次补入/再次补入”
+    conn.execute(
+        """
+        INSERT INTO sample_inventory (sample_id, balance, updated_at)
+        VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        ON CONFLICT (sample_id) DO UPDATE SET
+            balance = balance + excluded.balance,
+            updated_at = excluded.updated_at
+        """,
+        (batch_id, payload.portions),
+    )
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT si.sample_id, b.name AS sample_name, si.balance, si.updated_at
+        FROM sample_inventory si
+        JOIN batches b ON b.id = si.sample_id
+        WHERE si.sample_id = ?
+        """,
+        (batch_id,),
+    ).fetchone()
+    return _inventory_out(conn, row)
+
+
+@app.get(
+    "/batches/{batch_id}/inventory",
+    response_model=InventoryOut,
+    summary="查询原始样本库存余额",
+)
+def get_inventory(
+    batch_id: int, conn: sqlite3.Connection = Depends(get_db)
+) -> InventoryOut:
+    row = _fetch_batch(conn, batch_id)
+    if row is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {batch_id}")
+    if row["kind"] != "sample":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"只有原始样本有库存（kind='sample'）: {batch_id}",
+        )
+
+    inv = conn.execute(
+        """
+        SELECT si.sample_id, b.name AS sample_name, si.balance, si.updated_at
+        FROM sample_inventory si
+        JOIN batches b ON b.id = si.sample_id
+        WHERE si.sample_id = ?
+        """,
+        (batch_id,),
+    ).fetchone()
+    # 从未补入过的原始样本余额视为 0
+    if inv is None:
+        inv = {
+            "sample_id": batch_id,
+            "sample_name": row["name"],
+            "balance": 0,
+            "updated_at": None,
+        }
+    return _inventory_out(conn, inv)
+
+
+def _build_preparation_out(
+    conn: sqlite3.Connection, prep: sqlite3.Row
+) -> PreparationOut:
+    """组装制备记录响应：消耗明细 + 当前剩余库存（实时查询，GET 复用）。"""
+    # LEFT JOIN：每个消耗样本对应一行剩余库存；正常数据下被消耗样本必有库存行，
+    # COALESCE 仅为异常数据兜底（余额视为 0、无更新时间）
+    rows = conn.execute(
+        """
+        SELECT pc.sample_id, b.name AS sample_name, pc.portions,
+               COALESCE(si.balance, 0) AS balance, si.updated_at AS updated_at
+        FROM preparation_consumptions pc
+        JOIN batches b ON b.id = pc.sample_id
+        LEFT JOIN sample_inventory si ON si.sample_id = pc.sample_id
+        WHERE pc.preparation_id = ?
+        ORDER BY pc.sample_id
+        """,
+        (prep["id"],),
+    ).fetchall()
+    batch_name = conn.execute(
+        "SELECT name FROM batches WHERE id = ?", (prep["batch_id"],)
+    ).fetchone()["name"]
+    return PreparationOut(
+        id=prep["id"],
+        batch_id=prep["batch_id"],
+        batch_name=batch_name,
+        times=prep["times"],
+        created_at=prep["created_at"],
+        consumptions=[
+            PreparationConsumptionOut(
+                sample_id=r["sample_id"], sample_name=r["sample_name"], portions=r["portions"]
+            )
+            for r in rows
+        ],
+        remaining_inventory=[
+            InventoryOut(
+                sample_id=r["sample_id"],
+                sample_name=r["sample_name"],
+                balance=r["balance"],
+                updated_at=r["updated_at"],
+            )
+            for r in rows
+        ],
+    )
+
+
+@app.post(
+    "/batches/{batch_id}/preparations",
+    response_model=PreparationOut,
+    status_code=status.HTTP_201_CREATED,
+    summary="批次制备：按配方整数消耗原始样本库存（同一事务核算与扣减）",
+)
+def create_preparation(
+    batch_id: int,
+    payload: PreparationCreateRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> PreparationOut:
+    # 未知批次按需求明确返回 400（区别于 GET /batches/{id} 的 404）
+    row = _fetch_batch(conn, batch_id)
+    if row is None:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {batch_id}")
+
+    # 核算与扣减必须在同一 SQLite 写事务内完成：BEGIN IMMEDIATE 取写锁，
+    # 余额读取、缺口核算、库存扣减与制备记录写入彼此原子，并发制备相互串行
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # 沿配方图逐层乘算、多路径合并，得到各原始样本的整数需求；
+        # 原始样本目标直接消耗自身（每制备一次 1 份）
+        required = preparation_requirements(conn, batch_id, payload.times)
+        sample_ids = sorted(required)
+        balances = {
+            r["sample_id"]: r["balance"]
+            for r in conn.execute(
+                """
+                SELECT sample_id, balance FROM sample_inventory
+                WHERE sample_id IN (%s)
+                """
+                % ", ".join("?" for _ in sample_ids),
+                sample_ids,
+            )
+        } if sample_ids else {}
+
+        # 任一样本库存不足即整体回滚：库存与制备记录均不变化
+        shortages = []
+        for sid in sample_ids:
+            available = balances.get(sid, 0)
+            if available < required[sid]:
+                shortages.append({
+                    "sample_id": sid,
+                    "required": required[sid],
+                    "available": available,
+                    "shortage": required[sid] - available,
+                })
+        if shortages:
+            shortage_ids = [item["sample_id"] for item in shortages]
+            names = {
+                r["id"]: r["name"]
+                for r in conn.execute(
+                    "SELECT id, name FROM batches WHERE id IN (%s)"
+                    % ", ".join("?" for _ in shortage_ids),
+                    shortage_ids,
+                )
+            }
+            for item in shortages:
+                item["sample_name"] = names[item["sample_id"]]
+            conn.rollback()
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={"message": "原始样本库存不足", "shortages": shortages},
+            )
+
+        # 足量：一次扣减并写入制备记录与消耗明细（同一事务提交）
+        cur = conn.execute(
+            "INSERT INTO preparations (batch_id, times) VALUES (?, ?)",
+            (batch_id, payload.times),
+        )
+        preparation_id = cur.lastrowid
+        conn.executemany(
+            """
+            INSERT INTO preparation_consumptions (preparation_id, sample_id, portions)
+            VALUES (?, ?, ?)
+            """,
+            [(preparation_id, sid, required[sid]) for sid in sample_ids],
+        )
+        conn.executemany(
+            "UPDATE sample_inventory SET balance = balance - ? WHERE sample_id = ?",
+            [(required[sid], sid) for sid in sample_ids],
+        )
+        conn.commit()
+    except HTTPException:
+        raise
+
+    prep = conn.execute(
+        "SELECT * FROM preparations WHERE id = ?", (preparation_id,)
+    ).fetchone()
+    return _build_preparation_out(conn, prep)
+
+
+@app.get(
+    "/preparations/{preparation_id}",
+    response_model=PreparationOut,
+    summary="按记录 id 查询制备记录（含消耗明细与当前剩余库存）",
+)
+def get_preparation(
+    preparation_id: int, conn: sqlite3.Connection = Depends(get_db)
+) -> PreparationOut:
+    prep = conn.execute(
+        "SELECT * FROM preparations WHERE id = ?", (preparation_id,)
+    ).fetchone()
+    if prep is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, detail=f"制备记录不存在: {preparation_id}"
+        )
+    return _build_preparation_out(conn, prep)
